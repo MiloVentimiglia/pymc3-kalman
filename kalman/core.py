@@ -1,204 +1,299 @@
+import numpy as np
+import theano
+import theano.tensor as tt
+
+from pymc3.distributions import Continuous
+
+solve_l = tt.slinalg.solve_lower_triangular
+solve_u = tt.slinalg.solve_upper_triangular
 
 __all__ = ['KalmanTheano', 'KalmanFilter']
 
-import numpy              as np
-import theano
-import theano.tensor      as tt
 
-import pymc3
-from pymc3.distributions  import Continuous
+class DimensionalityError(Exception):
+    pass
 
-def _det_and_inv(A):
-    """Get matrix det and inv, with special cases for small matrices"""
 
-    if tt.eq(A.ndim, 0):
-        det = A
-        inv = 1/A
-    elif tt.eq(A.shape, (1,1)):
-        det = A[0,0]
-        inv = 1/A
-    else:
-        det = tt.nlinalg.det(A)
-        inv = tt.nlinalg.matrix_inverse(A)
+def _filter(y, Phi, Q, L, c, H, Sv, d, s, P):
+    """
+    Perform 1 filtering step.  The previous state estimates and log likelihood
+    up to the previous time step being given by (s, P).  The rest of
+    the arguments are parameters for the state space model.
+    """
+    s_fwd, P_fwd, y_est, y_est_var = _predict(s, P, Phi, Q, L, c, H, Sv, d)
 
-    return det, inv
+    # Cholesky factor and estimation error
+    Ly_est_var = tt.slinalg.cholesky(y_est_var)
+    err = y - y_est
 
-def _oneStepPredictionState(ai, Pi, T, c, R, Q):
+    # make corrections
+    s_cor, P_cor = _correct(s_fwd, Ly_est_var, err, P_fwd, Phi, H)
 
-    afpred = T.dot(ai) + c
-    Pfpred = T.dot(Pi).dot(T.T) + R.dot(Q).dot(R.T)
+    # Accumulate loglikelihood
+    log_l = _log_likelihood(err, Ly_est_var)
+    return s_cor, P_cor, log_l
 
-    return afpred, Pfpred
 
-def _oneStepPredictionObs(afpred, Pfpred, Z, d, H):
+def _predict(s, P, Phi, Q, L, c, H, Sv, d):
+    """
+    Kalman filter prediction step
+    """
+    # State propogation
+    s_fwd = tt.dot(Phi, s) + c
+    P_fwd = tt.dot(tt.dot(Phi, P), Phi.T) + tt.dot(tt.dot(L, Q), L.T)
 
-    bfpred = Z.dot(afpred) + d
-    Ffpred = Z.dot(Pfpred).dot(Z.T) + H
+    # Output estimate and uncertainty
+    y_est = tt.dot(H, s_fwd) + d
+    y_est_var = tt.dot(tt.dot(H, P_fwd), H.T) + Sv
+    return s_fwd, P_fwd, y_est, y_est_var
 
-    return bfpred, Ffpred
 
-def _oneStepPredictionLlik(y, bfpred, Ffpreddet, Ffpredinv):
+def _correct(s_fwd, Ly, err, P_fwd, Phi, H):
+    K = tt.dot(P_fwd, solve_u(Ly.T, solve_l(Ly, H)).T)
+    s_cor = s_fwd + tt.dot(K, err)
+    KL = tt.dot(K, Ly)
+    P_cor = P_fwd - tt.dot(KL, KL.T)
+    return s_cor, P_cor
 
-    if tt.eq(y.ndim, 0):
-        N = 1
-    else:
-        N = y.shape[0]
-    v = (y - bfpred)
 
-    return -0.5*(N*np.log(2 * np.pi) + tt.log(Ffpreddet) + v.dot(Ffpredinv.dot(v)))
+def _log_likelihood(err, Ly):
+    n = err.shape[0]  # Number of dimensions
 
-def _oneStepUpdateState(y, afpred, Pfpred, bfpred, Ffpredinv, Z):
+    logdet = tt.log(tt.diag(Ly)).sum()
+    vTSv = tt.nlinalg.norm(solve_l(Ly, err), 2)**2
+    return -0.5 * (n * np.log(2 * np.pi) + logdet + vTSv)
 
-    af = afpred + Pfpred.dot(Z.T).dot(Ffpredinv).dot(y - bfpred)
-    Pf = Pfpred - Pfpred.dot(Z.T).dot(Ffpredinv).dot(Z).dot(Pfpred)
-
-    return af, Pf
-
-def _oneStep(y, Z, d, H, T, c, R, Q, ai, Pi):
-
-    # Prediction of the state vector distribution
-    afpred, Pfpred = _oneStepPredictionState(ai, Pi, T, c, R, Q)
-
-    # Prediction of the observation distribution
-    bfpred, Ffpred = _oneStepPredictionObs(afpred, Pfpred, Z, d, H)
-
-    # Log-likelihood of the prediction
-    Ffpreddet, Ffpredinv = _det_and_inv(Ffpred)
-    llik = _oneStepPredictionLlik(y, bfpred, Ffpreddet, Ffpredinv)
-
-    # Update of the state vector distribution based on the new data
-    af, Pf = _oneStepUpdateState(y, afpred, Pfpred, bfpred, Ffpredinv, Z)
-
-    return af, Pf, llik
 
 class KalmanTheano(object):
+    def __init__(self, Phi, Q, L, c, H, Sv, d, s0, P0, n, m, g):
+        # NOTE: If identical matrices happen to be passed in, theano
+        # NOTE: will recognize this can use references.  This can be
+        # NOTE: confusing as the names given below need not "stick".
 
-    def __init__(self, Z, d, H, T, c, R, Q, a0, P0):
-        
-        self.Z = tt.as_tensor_variable(Z, name='Z')
-        self.d = tt.as_tensor_variable(d, name='d')
-        self.H = tt.as_tensor_variable(H, name='H')
-        
-        self.T = tt.as_tensor_variable(T, name='T')
-        self.c = tt.as_tensor_variable(c, name='c')
-        self.R = tt.as_tensor_variable(R, name='R')
-        self.Q = tt.as_tensor_variable(Q, name='Q')
-        
-        self.a0 = tt.as_tensor_variable(a0, name='a0')
-        self.P0 = tt.as_tensor_variable(P0, name='P0')
-    
-    def filter(self, Y, **kwargs):
-        
-        Y = tt.as_tensor_variable(Y, name='Y')
-        
-        # Check which arguments are time-dependent sequences
-        dy = Y.ndim - 1         # Observations: scalar (0) or vector (1)
-        da = self.a0.ndim       # State: scalar (0) or vector (1)
-        dims_non_sequences = {'Z': dy+da, 'd': dy, 'H': 2*dy,
-                              'T': 2*da , 'c': da, 'R': 2*da, 'Q': 2*da}
-        sequences, non_sequences = [], []
-        for c, dim_non_seq in dims_non_sequences.items():
-            dim_real = getattr(self, c).ndim
-            if dim_real - dim_non_seq == 1:
-                sequences.append(c)
-            elif dim_real == dim_non_seq:
-                non_sequences.append(c)
+        # State transition
+        self.Phi = tt.as_tensor_variable(Phi, name="Phi")
+
+        # State innovations
+        self.Q = tt.as_tensor_variable(Q, name="Q")
+
+        # Innovations modifier
+        self.L = tt.as_tensor_variable(L, name="L")
+
+        # State structural component
+        self.c = tt.as_tensor_variable(c, name="c")
+
+        # Observation matrix
+        self.H = tt.as_tensor_variable(H, name="H")
+
+        # Observation noise variance
+        self.Sv = tt.as_tensor_variable(Sv, name="Sv")
+
+        # Observation structural component
+        self.d = tt.as_tensor_variable(d, name="d")
+
+        # Initial state mean
+        self.s0 = tt.as_tensor_variable(s0, name="s0")
+
+        # Initial state variance
+        self.P0 = tt.as_tensor_variable(P0, name="P0")
+
+        self.n = n  # Output dimension
+        self.m = m  # State dimension
+        self.g = g  # Innovations dimension (often m == g)
+
+        self.tensors = [self.Phi, self.Q, self.L, self.c,
+                        self.H, self.Sv, self.d]
+        self.tensor_names = ["Phi", "Q", "L", "c",
+                             "H", "Sv", "d"]
+        self.tensor_dims = [2, 2, 2, 1, 2, 2, 1]  # Matrix or vector
+
+        self._validate()
+        return
+
+    def _validate(self):
+        sequences = []
+        non_sequences = []
+
+        def is_seq(tnsr, dim=1):
+            ndim = tnsr.ndim
+            if ndim == dim:
+                return False
+            elif ndim == dim + 1:
+                return True
             else:
-                raise ValueError('"%s" should have depth %d or %d; got %d'
-                                 % (c, dim_non_seq, dim_non_seq+1, dim_real))
-        
-        # Create function with correct ordering
-        fn = eval('lambda %s: _oneStep(y,Z,d,H,T,c,R,Q,ai,Pi)'
-                  % ','.join(['y'] + sequences + ['ai', 'Pi'] + non_sequences))
-        
-        (at, Pt, lliks), updates = theano.scan(
-            fn            = fn,
-            sequences     = [Y] + [getattr(self, v) for v in sequences],
-            outputs_info  = [dict(initial=self.a0),
-                             dict(initial=self.P0),
-                             None],
-            non_sequences = [getattr(self, v) for v in non_sequences],
-            strict        = True,
-            **kwargs)
-        
-        return (at, Pt, lliks), updates
+                raise DimensionalityError(
+                    "Variable {} has {} dimensions, but "
+                    "should have only {} or {}"
+                    "".format(tnsr.name, ndim, dim, dim + 1))
+
+        def append_seq(name, tnsr, expected_dim=1):
+            if is_seq(tnsr, dim):
+                sequences.append((tnsr, name))
+            else:
+                non_sequences.append((tnsr, name))
+
+        for name, tnsr, dim in zip(self.tensor_names,
+                                   self.tensors,
+                                   self.tensor_dims):
+            append_seq(name, tnsr, dim)
+
+        self.sequences = sequences
+        self.non_sequences = non_sequences
+        return
+
+    def filter(self, Y, **th_scan_kwargs):
+        # Create function with correct ordering for scan
+        fn = eval(
+            "lambda {}: _filter(y, Phi, Q, L, c, H, Sv, d, s, P)"
+            "".format(",".join(
+                ["y"] +
+                [tnsr_name[1] for tnsr_name in self.sequences] +
+                ["s", "P"] +
+                [tnsr_name[1] for tnsr_name in self.non_sequences])))
+
+        (st, Pt, log_l), updates = theano.scan(
+            fn=fn,
+            sequences=[Y] + [tnsr_name[0] for tnsr_name in self.sequences],
+            outputs_info=[dict(initial=self.s0),
+                          dict(initial=self.P0),
+                          None],
+            non_sequences=[tnsr_name[0] for tnsr_name in self.non_sequences],
+            strict=True,
+            **th_scan_kwargs)
+        return (st, Pt, log_l.sum()), updates
+
 
 class KalmanFilter(Continuous):
     """
-    Implements a generic Kalman filter in general state space form
-    
+    Implements a generic Kalman filter in general state space form.
+
     Shape of the input tensors is given as a function of:
-    
-    * N: number of time steps,
+
+    * T: number of time steps,
     * n: size of the observation vector
     * m: size of the state vector
     * g: size of the disturbance vector in the transition equation
-    
+
     The following rules define tensor dimension reductions allowed:
-    
-    * If a tensor is time-invariant, the time dimension N can be omitted
+
+    * If a tensor is time-invariant, the time dimension T can be omitted
     * If n=1, all dimensions of size n can be omitted
     * If m=1 and g=1, all dimensions of size m and g can be omitted
-    
+
     Parameters
     ----------
-    Z : tensor or numpy array, dimensions N x n x m
-        Tensor relating observation and state vectors
-    d : tensor or numpy array, dimensions N x n
-        Shift in the measurement equation
-    H : tensor or numpy array, dimensions N x n x n
-        Covariance matrix of the disturbances in the measurement equation
-    T : tensor or numpy array, dimensions N x m x m
-        Tensor relating the state vectors at times t-1, t
-    c : tensor or numpy array, dimensions N x m
-        Shift in the transition equation
-    R : tensor or numpy array, dimensions N x m x g
-        Tensor applying transition equation disturbances to state space
-    Q : tensor or numpy array, dimensions N x g x g
+    Phi : tensor or numpy array, dimensions T x m x m
+          Tensor relating the state vectors at times t - 1, t
+    c : tensor or numpy array, dimensions T x m
+        offset in the state transition equation
+    Q : tensor or numpy array, dimensions T x g x g
         Covariance matrix of the disturbances in the transition equation
-    a0 : tensor or numpy array, dimensions n
-        Mean of the initial state vector
+    L : tensor or numpy array, dimensions T x m x g
+        Tensor applying transition equation disturbances to state space
+    H : tensor or numpy array, dimensions T x n x m
+          Tensor relating observation and state vectors
+    d : tensor or numpy array, dimensions T x n
+        Shift in the observation equation
+    Sv : tensor or numpy array, dimensions T x n x n
+         Covariance for the observation noise
+    s0 : tensor or numpy array, dimensions n
+         Mean of the initial state vector
     P0 : tensor or numpy array, dimensions n x n
-        Covariance of the initial state vector
+         Covariance of the initial state vector
     *args, **kwargs
         Extra arguments passed to :class:`Continuous` initialization
-    
+
     Notes
     -----
-    
-    The general state space form (SSF) applies to a multivariate time series,
-    y(t), containing n elements. These observable variables are related to a
-    state vector a(t), containing m elements, via a measurement equation:
-    
-    .. math :
-        
-        y(t) = Z(t) a(t) + d(t) + \\varepsilon(t)\\,\\qquad
-             \\varepsilon(t) \\sim \\mathcal{N}_n(0, H(t))\\ ,
-    
-    Although a(t) is typically not observable, its dynamics is governed by a
-    first-order Markov process,  given by the transition equation:
-    
-    .. math :
-    
-        a(t) = T(t) a(t-1) + c(t) + R(t) \\eta(t)\\,\\qquad
-             \\eta(t) \\sim \\mathcal{N}_g(0, Q(t))\\ .
-    
-    Nomenclature taken from:
-    
-    Forecasting, structural time series models and the Kalman filter  
-    Andrew C. Harvey (1989)
-    """
-    
-    def __init__(self, Z, d, H, T, c, R, Q, a0, P0, *args, **kwargs):
-        
-        super(KalmanFilter, self).__init__(*args, **kwargs)
-        
-        self._op  = KalmanTheano(Z, d, H, T, c, R, Q, a0, P0)
-        self.mean = tt.as_tensor_variable(0.)
-    
-    def logp(self, Y):
-        
-        (_, _, lliks), _ = self._op.filter(Y)
-        
-        return lliks[1:].sum()
 
+    The general state space form (SSF) applies to a multivariate time series,
+    y(t), containing n elements. We suppose that there is some underlying
+    or background "state" s(t) containing m elements:
+
+    .. math :
+
+        s(t) = Phi(t) s(t-1) + c(t) + L(t) \\w(t)\\,\\qquad
+             \\w(t) \\sim \\mathcal{N}_g(0, Q(t))\\
+        s(0) \\sim \\mathcal{N}_m(s0, P0)
+
+    These state variables generate the data via the "observation" equations:
+
+    .. math :
+
+        y(t) = H(t) s(t) + d(t) + \\v(t)\\,\\qquad
+             \\v(t) \\sim \\mathcal{N}_n(0, Sv(t))\\ ,
+
+    Although s(t) is typically not observable, its dynamics are governed by a
+    first-order Gauss-Markov process.  The entire model is amenable to
+    exact inference.
+
+    The matrix L (which would correspond to a cholesky factor of the state
+    variance if Q = I) can be used to linearly transform the state innovations
+    w(t) and can be useful for modelling low-rank innovations.
+    """
+    def __init__(self, Phi, Q, L, c, H, Sv, d, s0, P0, n, m, g,
+                 *args, **kwargs):
+        Continuous.__init__(self, *args, **kwargs)
+
+        self._kalman_theano = KalmanTheano(Phi, Q, L, c, H, Sv, d, s0, P0,
+                                           n, m, g, **kwargs)
+        self.mean = tt.as_tensor_variable(0.)
+        return
+
+    def logp(self, Y):
+        (_, _, log_p), _ = self._kalman_theano.filter(Y)
+        return log_p
+
+
+if __name__ == "NONAME":
+    n = 3
+    m = 10
+
+    T = 2048
+    phi = 0.99
+    v = np.random.normal(size=(T, m))
+    Y = np.zeros((T, m))
+    Y[0, :] = v[0, :]
+    for t, vt in enumerate(v[1:]):
+        Y[t + 1, :] = phi * Y[t, :] + vt
+
+    sv_tnsr = tt.vector("sv")
+    Sv_tnsr = tt.diag(sv_tnsr)
+
+    # def __init__(self, Phi, Q, L, c, H, Sv, d, s0, P0, n, m, g,
+    K = KalmanTheano(Phi=0.92 * np.eye(n), Q=0.2 * np.eye(n),
+                     L=np.eye(n), c=np.zeros(n),
+                     H=np.random.normal(size=(m, n)),
+                     Sv=Sv_tnsr,
+                     d=np.zeros(m),
+                     s0=np.zeros(n),
+                     P0=10 * np.eye(n),
+                     n=n, m=m, g=n)
+    Y_tensor = tt.matrix("Y")
+    (s, P, ll), _ = K.filter(Y_tensor)
+    kf = theano.function(inputs=[Y_tensor, sv_tnsr], outputs=[s, P, ll],
+                         mode=theano.Mode(optimizer="unsafe"))
+
+    s, P, ll = kf(Y, 2 * np.ones(m))
+
+    import pymc3 as pm
+
+    with pm.Model() as model:
+        # Phi, Q, L, c, H, Sv, d, s0, P0, n, m, g
+
+        phi = pm.Normal("phi", shape=(1, 1))
+        q = pm.HalfStudentT("q", nu=1.0, sd=2.0, shape=(1, 1))
+        K = KalmanFilter("kf", phi, q,
+                         np.array([[1.]]),
+                         np.array([0.]),
+                         np.array([[1.]]),
+                         np.array([[0.0]]),
+                         np.array([0.]),
+                         np.array([0.]),
+                         np.array([[10.]]),
+                         1, 1, 1,
+                         observed=y)
+
+    with model:
+        # approx = pm.fit(n=100, method="advi")
+        trace = pm.sample_approx(approx, draws=500)
